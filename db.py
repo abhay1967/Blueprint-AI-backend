@@ -20,4 +20,4 @@ chat = sqlalchemy.Table(
     sqlalchemy.Column("created_at", sqlalchemy.DateTime(timezone=True), server_default=sqlalchemy.func.now()),
 )
 
-database = databases.Database(DATABASE_URL)
+database = databases.Database(DATABASE_URL, connect_args={"statement_cache_size": 0})
