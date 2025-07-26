@@ -1,17 +1,52 @@
 # 📁 File: main.py
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, status, Request, Depends
+from fastapi.responses import JSONResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+import firebase_admin
+from firebase_admin import credentials, auth as firebase_auth
+import functools
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import uuid
 import os
+import uvicorn
+import uuid
+print("[DEBUG] DATABASE_URL:", os.getenv("DATABASE_URL"))
 from agents.research_agent import ResearchAgent
 from agents.feature_parser_agent import FeatureParserAgent
 from agents.architecture_planner_agent import ArchitecturePlannerAgent
 from agents.tech_stack_selector_agent import TechStackSelectorAgent
 from agents.security_infra_agent import SecurityInfraAgent
+from db import chat, database
+
+# Initialize Firebase Admin SDK if not already initialized
+if not firebase_admin._apps:
+    cred = credentials.Certificate(os.path.join(os.path.dirname(__file__), 'firebase-service-account.json'))
+    firebase_admin.initialize_app(cred)
 
 app = FastAPI()
+
+# Auth scheme for extracting JWT
+bearer_scheme = HTTPBearer()
+
+def authenticate_user(credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme)):
+    token = credentials.credentials
+    try:
+        decoded_token = firebase_auth.verify_id_token(token)
+        return decoded_token
+    except Exception as e:
+        print(f"[AUTH] Invalid token: {e}")
+        raise HTTPException(status_code=401, detail="Invalid or missing authentication token")
+
+
+@app.on_event("startup")
+async def startup():
+    await database.connect()
+    print("[DEBUG] DATABASE_URL:", os.getenv("DATABASE_URL"))
+
+@app.on_event("shutdown")
+async def shutdown():
+    await database.disconnect()
 
 # Enable CORS
 app.add_middleware(
@@ -22,18 +57,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-memory chat store (replace with database in production)
-chat_store = {}
 
 # 🧾 Request schema
 class ProductIdea(BaseModel):
-    product_idea: str
+    title: str
 
 # 📄 Response schema
 class Chat(BaseModel):
     id: str
-    product_idea: str
-    response: str
+    title: str
+    created_at: str
 
 # 🔧 Health check
 @app.get("/health")
@@ -42,38 +75,126 @@ def health_check():
 
 # 🧠 AI Architecture pipeline endpoint (non-streaming)
 @app.post("/blueprint")
-def run_blueprint(request: ProductIdea):
-    result = {}
-    error = None
+async def run_blueprint(request: ProductIdea):
     try:
-        result = run_blueprint_ai(request.product_idea)
-        chat_id = str(uuid.uuid4())
-        chat_store[chat_id] = {
-            "id": chat_id,
-            "product_idea": request.product_idea,
-            "response": result
-        }
-        return chat_store[chat_id]
+        result = run_blueprint_ai(request.title)
     except Exception as e:
-        # If run_blueprint_ai returns partials, use them, else just error
-        if isinstance(result, dict):
-            result["error"] = str(e)
-            return result
-        return {"error": str(e)}
-
+        return {"error": str(e)}, 500
+    chat_id = str(uuid.uuid4())
+    now = datetime.datetime.utcnow()
+    user_message_id = str(uuid.uuid4())
+    assistant_message_id = str(uuid.uuid4())
+    query = chat.insert().values(
+        id=chat_id,
+        title=request.title,
+        user_message=request.title,
+        assistant_message=result,
+        created_at=now
+    )
+    await database.execute(query)
+    return {
+        "id": chat_id,
+        "title": request.title,
+        "createdAt": now.isoformat(),
+        "messages": [
+            {"id": user_message_id, "role": "user", "content": request.title},
+            {"id": assistant_message_id, "role": "assistant", "content": result}
+        ]
+    }
 
 # 🧾 Return all chats
 @app.get("/chats")
-def get_chats():
-    return list(chat_store.values())
+async def get_chat(user=Depends(authenticate_user)):
+    import traceback
+    print("[BACKEND] Fetching chat for user:", user)
+    print("[BACKEND] user['uid']:", user.get('uid'), type(user.get('uid')))
+    try:
+        query = chat.select().where(chat.c.user_id == user["uid"]).order_by(chat.c.created_at.desc())
+        rows = await database.fetch_all(query)
+        chats_list = []
+        for row in rows:
+            chats_list.append({
+                "id": str(row["id"]),
+                "title": row["title"],
+                "createdAt": row["created_at"].isoformat() if row["created_at"] else None,
+                "messages": [
+                    {"id": str(uuid.uuid4()), "role": "user", "content": row["user_message"]},
+                    {"id": str(uuid.uuid4()), "role": "assistant", "content": row["assistant_message"]}
+                ]
+            })
+        print(f"[BACKEND] Returning {len(chats_list)} chat for user {user['uid']}")
+        return chats_list
+    except Exception as e:
+        print("[BACKEND] Exception in /chat endpoint:", str(e))
+        traceback.print_exc()
+        return JSONResponse({"status": "error", "detail": str(e)}, status_code=500)
+
+
+# 💾 Save chat (insert or update)
+class SaveChatRequest(BaseModel):
+    chat_id: str
+    title: str
+    messages: list
+
+@app.post("/chat/save")
+async def save_chat(request: Request, user=Depends(authenticate_user)):
+    data = await request.json()
+    print("[BACKEND] Received /chat/save data:", data)
+    print("[BACKEND] Authenticated user:", user)
+    chat_id = data.get("chat_id")
+    title = data.get("title")
+    messages = data.get("messages")
+    user_message = ""
+    assistant_message = ""
+    if messages and len(messages) >= 2:
+        user_message = messages[-2]["content"]
+        assistant_message = messages[-1]["content"]
+    elif messages and len(messages) == 1:
+        user_message = messages[0]["content"]
+    try:
+        # Try to update existing chat for this user
+        query = chat.update().where((chat.c.id == chat_id) & (chat.c.user_id == user["uid"]))\
+            .values(
+                user_id=user["uid"],
+                title=title,
+                user_message=user_message,
+                assistant_message=assistant_message,
+            )
+        result = await database.execute(query)
+        print("[BACKEND] Update result:", result)
+        if not result:
+            print("[BACKEND] No rows updated, inserting new chat...")
+            insert_query = chat.insert().values(
+                id=chat_id,
+                user_id=user["uid"],
+                title=title,
+                user_message=user_message,
+                assistant_message=assistant_message,
+            )
+            insert_result = await database.execute(insert_query)
+            print("[BACKEND] Insert result:", insert_result)
+        else:
+            print("[BACKEND] Chat updated, skipping insert.")
+        print("[BACKEND] Upserted chat for user:", user["uid"])
+        # Debug: fetch all chat to confirm insert
+        try:
+            all_chat = await database.fetch_all(chat.select())
+            print(f"[DEBUG] All chat in DB after save: {all_chat}")
+        except Exception as db_debug_exc:
+            print("[DEBUG] Error fetching all chats:", db_debug_exc)
+        return {"status": "saved"}
+    except Exception as e:
+        import traceback
+        print("[ERROR] Exception in /chat/save:", e)
+        traceback.print_exc()
+        return JSONResponse({"status": "error", "detail": str(e)}, status_code=500)
 
 # 🧹 Delete chat by ID
 @app.delete("/chat/{chat_id}/delete")
-def delete_chat(chat_id: str):
-    if chat_id in chat_store:
-        del chat_store[chat_id]
-        return {"status": "deleted"}
-    raise HTTPException(status_code=404, detail="Chat not found")
+async def delete_chat(chat_id: str):
+    query = chat.delete().where(chat.c.id == chat_id)
+    await database.execute(query)
+    return {"status": "deleted"}
 
 # 🚀 Generate via /generate-architecture-stream/
 from stream_utils import stream_blueprint_ai
@@ -82,7 +203,7 @@ from fastapi.responses import StreamingResponse
 @app.post("/generate-architecture-stream/")
 def generate_architecture(request: ProductIdea):
     return StreamingResponse(
-        stream_blueprint_ai(request.product_idea),
+        stream_blueprint_ai(request.title),
         media_type="text/event-stream"
     )
 
