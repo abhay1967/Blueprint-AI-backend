@@ -7,6 +7,7 @@ import firebase_admin
 from firebase_admin import credentials, auth as firebase_auth
 import functools
 from fastapi.middleware.cors import CORSMiddleware
+import json
 from pydantic import BaseModel
 import os
 import uvicorn
