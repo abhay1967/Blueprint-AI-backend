@@ -180,15 +180,16 @@ async def save_chat(request: Request, user=Depends(authenticate_user)):
                 "created_at": now
             }
         )
-        result = await database.execute(upsert_stmt)
-        print("[BACKEND] Upsert result:", result)
+        upsert_stmt = upsert_stmt.returning(chat)
+        result = await database.fetch_one(upsert_stmt)
+        print("[BACKEND] Upsert result (inserted/updated row):", result)
         # Debug: fetch all chat to confirm insert
         try:
             all_chat = await database.fetch_all(chat.select())
             print(f"[DEBUG] All chat in DB after save: {all_chat}")
         except Exception as db_debug_exc:
             print("[DEBUG] Error fetching all chats:", db_debug_exc)
-        return {"status": "saved"}
+        return {"status": "saved", "row": dict(result) if result else None}
     except Exception as e:
         import traceback
         print("[ERROR] Exception in /chat/save:", e)
