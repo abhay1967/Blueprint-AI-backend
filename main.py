@@ -89,7 +89,7 @@ async def run_blueprint(request: ProductIdea):
         id=chat_id,
         title=request.title,
         user_message=request.title,
-        assistant_message=result,
+        assistant_message=json.dumps(result),
         created_at=now
     )
     await database.execute(query)
@@ -99,7 +99,7 @@ async def run_blueprint(request: ProductIdea):
         "createdAt": now.isoformat(),
         "messages": [
             {"id": user_message_id, "role": "user", "content": request.title},
-            {"id": assistant_message_id, "role": "assistant", "content": result}
+            {"id": assistant_message_id, "role": "assistant", "content": json.dumps(result)}
         ]
     }
 
