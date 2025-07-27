@@ -121,14 +121,25 @@ async def get_chat(user=Depends(authenticate_user)):
         rows = await database.fetch_all(query)
         chats_list = []
         for row in rows:
+            # Use messages column if present and not None
+            messages = row["messages"] if "messages" in row and row["messages"] else None
+            if messages:
+                chat_messages = messages
+            else:
+                chat_messages = []
+                if row["user_message"]:
+                    chat_messages.append({
+                        "id": str(uuid.uuid4()), "role": "user", "content": row["user_message"]
+                    })
+                if row["assistant_message"]:
+                    chat_messages.append({
+                        "id": str(uuid.uuid4()), "role": "assistant", "content": row["assistant_message"]
+                    })
             chats_list.append({
                 "id": str(row["id"]),
                 "title": row["title"],
                 "createdAt": row["created_at"].isoformat() if row["created_at"] else None,
-                "messages": [
-                    {"id": str(uuid.uuid4()), "role": "user", "content": row["user_message"]},
-                    {"id": str(uuid.uuid4()), "role": "assistant", "content": row["assistant_message"]}
-                ]
+                "messages": chat_messages
             })
         print(f"[BACKEND] Returning {len(chats_list)} chat for user {user['uid']}")
         return chats_list
@@ -154,11 +165,19 @@ async def save_chat(request: Request, user=Depends(authenticate_user)):
     messages = data.get("messages")
     user_message = ""
     assistant_message = ""
-    if messages and len(messages) >= 2:
-        user_message = messages[-2]["content"]
-        assistant_message = messages[-1]["content"]
-    elif messages and len(messages) == 1:
-        user_message = messages[0]["content"]
+    if messages and len(messages) > 0:
+        # Find last user message for user_message
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                user_message = msg.get("content", "")
+                break
+        # Concatenate all assistant/agent messages for assistant_message
+        assistant_contents = [
+            msg.get("content", "")
+            for msg in messages
+            if msg.get("role") != "user"
+        ]
+        assistant_message = "\n\n".join(assistant_contents)
     try:
         # UPSERT: Insert or update on conflict (id, user_id)
         from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -169,7 +188,8 @@ async def save_chat(request: Request, user=Depends(authenticate_user)):
             title=title,
             user_message=user_message,
             assistant_message=assistant_message,
-            created_at=now
+            created_at=now,
+            messages=messages
         ).on_conflict_do_update(
             index_elements=[chat.c.id],
             set_={
@@ -177,7 +197,8 @@ async def save_chat(request: Request, user=Depends(authenticate_user)):
                 "title": title,
                 "user_message": user_message,
                 "assistant_message": assistant_message,
-                "created_at": now
+                "created_at": now,
+                "messages": messages
             }
         )
         upsert_stmt = upsert_stmt.returning(chat)

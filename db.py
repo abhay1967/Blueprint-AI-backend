@@ -18,6 +18,7 @@ chat = sqlalchemy.Table(
     sqlalchemy.Column("user_message", sqlalchemy.Text),
     sqlalchemy.Column("assistant_message", sqlalchemy.Text),
     sqlalchemy.Column("created_at", sqlalchemy.DateTime(timezone=True), server_default=sqlalchemy.func.now()),
+    sqlalchemy.Column("messages", sqlalchemy.JSON),
 )
 
 database = databases.Database(DATABASE_URL)
