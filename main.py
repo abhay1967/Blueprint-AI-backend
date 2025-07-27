@@ -77,7 +77,7 @@ def health_check():
 
 # 🧠 AI Architecture pipeline endpoint (non-streaming)
 @app.post("/blueprint")
-async def run_blueprint(request: ProductIdea):
+async def run_blueprint(request: ProductIdea, user=Depends(authenticate_user)):
     try:
         result = run_blueprint_ai(request.title)
     except Exception as e:
@@ -86,8 +86,10 @@ async def run_blueprint(request: ProductIdea):
     now = datetime.datetime.utcnow()
     user_message_id = str(uuid.uuid4())
     assistant_message_id = str(uuid.uuid4())
+    user_id = user["uid"]
     query = chat.insert().values(
         id=chat_id,
+        user_id=user_id,
         title=request.title,
         user_message=request.title,
         assistant_message=json.dumps(result),
@@ -154,30 +156,28 @@ async def save_chat(request: Request, user=Depends(authenticate_user)):
     elif messages and len(messages) == 1:
         user_message = messages[0]["content"]
     try:
-        # Try to update existing chat for this user
-        query = chat.update().where((chat.c.id == chat_id) & (chat.c.user_id == user["uid"]))\
-            .values(
-                user_id=user["uid"],
-                title=title,
-                user_message=user_message,
-                assistant_message=assistant_message,
-            )
-        result = await database.execute(query)
-        print("[BACKEND] Update result:", result)
-        if not result:
-            print("[BACKEND] No rows updated, inserting new chat...")
-            insert_query = chat.insert().values(
-                id=chat_id,
-                user_id=user["uid"],
-                title=title,
-                user_message=user_message,
-                assistant_message=assistant_message,
-            )
-            insert_result = await database.execute(insert_query)
-            print("[BACKEND] Insert result:", insert_result)
-        else:
-            print("[BACKEND] Chat updated, skipping insert.")
-        print("[BACKEND] Upserted chat for user:", user["uid"])
+        # UPSERT: Insert or update on conflict (id, user_id)
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+        now = datetime.datetime.utcnow()
+        upsert_stmt = pg_insert(chat).values(
+            id=chat_id,
+            user_id=user["uid"],
+            title=title,
+            user_message=user_message,
+            assistant_message=assistant_message,
+            created_at=now
+        ).on_conflict_do_update(
+            index_elements=[chat.c.id],
+            set_={
+                "user_id": user["uid"],
+                "title": title,
+                "user_message": user_message,
+                "assistant_message": assistant_message,
+                "created_at": now
+            }
+        )
+        result = await database.execute(upsert_stmt)
+        print("[BACKEND] Upsert result:", result)
         # Debug: fetch all chat to confirm insert
         try:
             all_chat = await database.fetch_all(chat.select())
