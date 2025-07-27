@@ -28,6 +28,10 @@ if not firebase_admin._apps:
 
 app = FastAPI()
 
+@app.get("/")
+def root():
+    return {"message": "👋 Welcome to Blueprint AI Backend!", "status": "ok"}
+
 # Auth scheme for extracting JWT
 bearer_scheme = HTTPBearer()
 
